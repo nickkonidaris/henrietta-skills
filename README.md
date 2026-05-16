@@ -29,6 +29,24 @@ symlinks.
 To verify, start `claude` in any directory and ask "what henrietta skills do
 you have?".
 
+## One-time data-path setup (per machine)
+
+`load-frames` needs to know where the raw Commissioning frames are mounted,
+which differs by host. Pick one of these, do it once:
+
+```bash
+# Recommended: the team-convention symlink.
+ln -s /carnegie/scidata/groups/kallisto/Henrietta/data/images/raw/Commissioning \
+      ~/Henrietta/data
+# (point it at wherever scidata is mounted on this machine)
+
+# Or set an env var in your shell rc:
+export HENRIETTA_DATA_DIR=/carnegie/scidata/groups/kallisto/Henrietta/data/images/raw/Commissioning
+```
+
+Analysis scripts then never need a hardcoded path. If neither is set,
+`load_frames` raises with instructions.
+
 ## Adding a skill
 
 1. `mkdir my-skill/`

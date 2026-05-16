@@ -15,10 +15,10 @@ don't quietly mix a dark into a flat sequence.
 ## What it does, in three steps
 
 1. **Identify** — Expand a frame-ID range or list into concrete file paths
-   under `/carnegie/scidata/groups/kallisto/Henrietta/data/images/raw/Commissioning/`.
-   Fitted-frame paths look like `hen{NNNN}.fits`; ramp-sample paths look like
-   `hen{NNNN}_{KKK}r.fits` (1-indexed `KKK`, three digits, typically up to
-   023).
+   under the resolved data directory (see *Setup* below — defaults to the
+   `~/Henrietta/data` symlink or `$HENRIETTA_DATA_DIR`). Fitted-frame paths
+   look like `hen{NNNN}.fits`; ramp-sample paths look like
+   `hen{NNNN}_{KKK}r.fits` (1-indexed `KKK`, three digits).
 2. **Confirm** — Verify every expected file is on disk, then verify the set
    is homogeneous across the headers that matter for analysis: `FILTER`,
    `GRISM`, `SLIT`, `EXPTIME`, `OBSTYPE`, `MODE`, and ramp depth (for SUTR).
@@ -28,6 +28,35 @@ don't quietly mix a dark into a flat sequence.
    as a numpy object array of `astropy.io.fits.Header` instances. Caller
    gets back a single `(data, headers)` tuple.
 
+## Setup — where does the data live?
+
+The scidata mount path varies per machine (`/carnegie/scidata/...` on Carnegie
+hosts, somewhere else on your laptop or a collaborator's box). The skill
+resolves the data directory in this order, falling through until one works:
+
+1. Explicit `data_dir=Path(...)` argument to `load_frames(...)`.
+2. `$HENRIETTA_DATA_DIR` environment variable.
+3. The team-convention symlink `~/Henrietta/data`.
+
+**Pick one and do it once per machine.** Recommended: the symlink, because
+analysis scripts then need no per-machine configuration.
+
+```bash
+# On a Carnegie host where scidata is mounted at the usual path:
+ln -s /carnegie/scidata/groups/kallisto/Henrietta/data/images/raw/Commissioning \
+      ~/Henrietta/data
+
+# On a different host where it's mounted elsewhere:
+ln -s /mnt/whatever/Commissioning ~/Henrietta/data
+
+# Or skip the symlink and use the env var (e.g. in ~/.bashrc):
+export HENRIETTA_DATA_DIR=/mnt/whatever/Commissioning
+```
+
+If none of those resolve, `load_frames` raises with a message telling you the
+three options. The skill never writes into the resolved directory — it only
+reads (see project-wide `/scidata` read-only convention).
+
 ## Reference implementation
 
 Drop this into the experiment's helper module, or run it ad-hoc. It is small
@@ -35,16 +64,41 @@ on purpose; don't extend it without a reason.
 
 ```python
 """load_frames — identify, confirm, read."""
+import os
 from pathlib import Path
 from collections.abc import Iterable
 import numpy as np
 from astropy.io import fits
 
-DATA_DIR = Path("/carnegie/scidata/groups/kallisto/Henrietta/data/images/raw/Commissioning")
-
 # Header keys that must agree across a homogeneous set. Missing keys in some
 # headers are tolerated; conflicting values are not.
 HOMOGENEITY_KEYS = ("FILTER", "GRISM", "SLIT", "EXPTIME", "OBSTYPE", "MODE")
+
+# Where to find the raw Commissioning frames. Resolution order:
+#   1. data_dir= argument to load_frames()
+#   2. $HENRIETTA_DATA_DIR environment variable
+#   3. ~/Henrietta/data  (team convention: symlink to wherever scidata is
+#      mounted on this machine)
+# Mount points vary by machine — never hardcode /carnegie/scidata/... in
+# analysis scripts; rely on this resolver instead.
+DEFAULT_SYMLINK = Path.home() / "Henrietta" / "data"
+
+
+def _resolve_data_dir(data_dir=None):
+    if data_dir is not None:
+        return Path(data_dir)
+    env = os.environ.get("HENRIETTA_DATA_DIR")
+    if env:
+        return Path(env)
+    if DEFAULT_SYMLINK.exists():
+        return DEFAULT_SYMLINK
+    raise FileNotFoundError(
+        "Cannot locate Henrietta data. Do one of:\n"
+        f"  - symlink {DEFAULT_SYMLINK} -> wherever scidata is mounted (e.g. "
+        "/carnegie/scidata/groups/kallisto/Henrietta/data/images/raw/Commissioning)\n"
+        "  - export HENRIETTA_DATA_DIR=/path/to/Commissioning\n"
+        "  - pass data_dir=Path(...) explicitly to load_frames()"
+    )
 
 
 def _expand_ids(ids):
@@ -58,11 +112,14 @@ def _expand_ids(ids):
     raise TypeError(f"frame_ids must be int, range, or iterable of ints; got {type(ids).__name__}")
 
 
-def _paths_for(frame_id, kind, n_samples):
+def _paths_for(frame_id, kind, data_dir):
     if kind == "fitted":
-        return [DATA_DIR / f"hen{frame_id}.fits"]
+        return [data_dir / f"hen{frame_id}.fits"]
     if kind == "ramp":
-        return [DATA_DIR / f"hen{frame_id}_{k+1:03d}r.fits" for k in range(n_samples)]
+        paths = sorted(data_dir.glob(f"hen{frame_id}_*r.fits"))
+        if not paths:
+            raise FileNotFoundError(f"no ramp samples found for hen{frame_id}_*r.fits in {data_dir}")
+        return paths
     raise ValueError(f"kind must be 'fitted' or 'ramp'; got {kind!r}")
 
 
@@ -87,21 +144,22 @@ def _check_homogeneous(headers_flat, frame_ids_flat):
             raise ValueError(f"frame set is inhomogeneous in {k}: {summary}")
 
 
-def load_frames(frame_ids, kind="fitted", n_samples=23, data_dir=DATA_DIR):
+def load_frames(frame_ids, kind="fitted", data_dir=None):
     """Identify, confirm, and read a set of Henrietta frames.
 
     Parameters
     ----------
     frame_ids : int | range | iterable of int
         Frame IDs to load. e.g. ``range(1755, 1761)`` or ``[1755, 1760]``.
-    kind : {"fitted", "ramp"}
+    kind : {"fitted", "ramp"}, default ``"fitted"``
         ``"fitted"`` -> one ``hen{NNNN}.fits`` per ID, data shape ``(N, H, W)``.
-        ``"ramp"``   -> ``hen{NNNN}_{KKK}r.fits`` for ``KKK = 1..n_samples``,
-        data shape ``(N, n_samples, H, W)``.
-    n_samples : int, default 23
-        Number of SUTR samples per ramp. Ignored for ``kind="fitted"``.
-    data_dir : Path
-        Where the raw frames live. Defaults to the kallisto commissioning tree.
+        ``"ramp"``   -> every ``hen{NNNN}_*r.fits`` sample on disk, data shape
+        ``(N, n_samples, H, W)``. ``n_samples`` is discovered from disk and
+        must agree across every frame ID in the set.
+    data_dir : Path, optional
+        Where the raw frames live. If omitted, resolves from
+        ``$HENRIETTA_DATA_DIR`` or the ``~/Henrietta/data`` symlink. See
+        ``_resolve_data_dir`` and the README for setup.
 
     Returns
     -------
@@ -116,16 +174,29 @@ def load_frames(frame_ids, kind="fitted", n_samples=23, data_dir=DATA_DIR):
     ------
     FileNotFoundError : any expected path is missing.
     ValueError       : the set is inhomogeneous in any HOMOGENEITY_KEYS field,
-                       or for ramps the per-ID sample count disagrees.
+                       or for ramps the on-disk sample count disagrees across IDs.
     """
     ids = _expand_ids(frame_ids)
+    data_dir = _resolve_data_dir(data_dir)
 
-    # 1. identify
-    paths_per_id = [_paths_for(fid, kind, n_samples) for fid in ids]
+    # 1. identify (for kind="ramp", this also discovers n_samples per ID)
+    paths_per_id = [_paths_for(fid, kind, data_dir) for fid in ids]
     flat_paths = [p for ps in paths_per_id for p in ps]
 
     # 2. confirm — files exist
     _check_exist(flat_paths)
+
+    # 2. confirm — ramp depth agrees across IDs
+    if kind == "ramp":
+        counts = {fid: len(ps) for fid, ps in zip(ids, paths_per_id)}
+        unique = set(counts.values())
+        if len(unique) > 1:
+            by_count = {}
+            for fid, c in counts.items():
+                by_count.setdefault(c, []).append(fid)
+            summary = "; ".join(f"{c} samples: {fids}" for c, fids in sorted(by_count.items()))
+            raise ValueError(f"ramp depth disagrees across set: {summary}")
+        n_samples = unique.pop()
 
     # 2. confirm — read headers, check homogeneity
     headers_flat = [fits.getheader(p) for p in flat_paths]
@@ -138,7 +209,6 @@ def load_frames(frame_ids, kind="fitted", n_samples=23, data_dir=DATA_DIR):
         data = np.stack(arrays, axis=0)                  # (N, H, W)
         headers = np.array(headers_flat, dtype=object)   # (N,)
     else:
-        # reshape to (N, n_samples, H, W)
         n = len(ids)
         h, w = arrays[0].shape
         data = np.stack(arrays, axis=0).reshape(n, n_samples, h, w)
