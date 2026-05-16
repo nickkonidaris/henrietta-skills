@@ -1,18 +1,32 @@
 ---
 name: load-frames
-description: Use whenever the user asks to open, read, or analyze a set of Henrietta FITS frames identified by frame-ID range or list. Identifies the on-disk paths, confirms every file exists and the set is homogeneous in filter/grism/exptime/ramp-depth, then loads the data into numpy arrays and returns the matching headers. Handles both fitted slope frames (hen{NNNN}.fits) and SUTR ramp samples (hen{NNNN}_{KKK}r.fits).
+description: Use whenever the user asks to open, read, or analyze a set of Henrietta FITS frames — either by explicit frame-ID range/list, or by target/purpose looked up in the commissioning observing-log CSV. Provides two functions: find_frames_for(target=..., purpose=...) returns a sorted list of frame IDs from the log; load_frames(ids, kind=...) confirms the on-disk set is homogeneous in filter/grism/exptime/ramp-depth and returns numpy arrays + matching headers. Handles both fitted slope frames (hen{NNNN}.fits) and SUTR ramp samples (hen{NNNN}_{KKK}r.fits).
 ---
 
 # load-frames
 
-The single canonical way to go from "frames 1755..1760" (or any list of frame
-IDs) to in-memory numpy arrays + headers. Always use this skill before
-running statistics or visualization on a set of Henrietta frames — it
-enforces the homogeneity check from `CLAUDE.md` ("when you open a set of
-frames in a range, please double check that they are homogenous") so you
-don't quietly mix a dark into a flat sequence.
+The canonical way to go from "frames 1755..1760" — or "every HD120270 frame
+in the log" — to in-memory numpy arrays + headers. Use this skill before
+running statistics or visualization on a set of Henrietta frames; it enforces
+the homogeneity check from `CLAUDE.md` ("when you open a set of frames in a
+range, please double check that they are homogenous") so you don't quietly
+mix a dark into a flat sequence.
 
-## What it does, in three steps
+The skill exposes two functions, kept separate on purpose:
+
+- **`find_frames_for(target=..., purpose=...)`** — looks up frame IDs in the
+  observing-log CSV. Pure metadata lookup; touches no FITS files.
+- **`load_frames(frame_ids, kind=...)`** — confirms the on-disk set is
+  homogeneous and returns `(data, headers)` as numpy arrays.
+
+Pipe one into the other:
+
+```python
+ids = find_frames_for(target="HD120270")
+data, hdr = load_frames(ids)
+```
+
+## What `load_frames` does, in three steps
 
 1. **Identify** — Expand a frame-ID range or list into concrete file paths
    under the resolved data directory (see *Setup* below — defaults to the
@@ -28,34 +42,38 @@ don't quietly mix a dark into a flat sequence.
    as a numpy object array of `astropy.io.fits.Header` instances. Caller
    gets back a single `(data, headers)` tuple.
 
-## Setup — where does the data live?
+## Setup — where do the data and the log live?
 
-The scidata mount path varies per machine (`/carnegie/scidata/...` on Carnegie
-hosts, somewhere else on your laptop or a collaborator's box). The skill
-resolves the data directory in this order, falling through until one works:
+Two paths vary per machine. Each resolves in the same order: explicit
+argument → env var → team-convention symlink.
 
-1. Explicit `data_dir=Path(...)` argument to `load_frames(...)`.
+### Raw frames
+
+1. `data_dir=Path(...)` argument to `load_frames(...)`.
 2. `$HENRIETTA_DATA_DIR` environment variable.
-3. The team-convention symlink `~/Henrietta/data`.
-
-**Pick one and do it once per machine.** Recommended: the symlink, because
-analysis scripts then need no per-machine configuration.
+3. The symlink `~/Henrietta/data`.
 
 ```bash
-# On a Carnegie host where scidata is mounted at the usual path:
 ln -s /carnegie/scidata/groups/kallisto/Henrietta/data/images/raw/Commissioning \
       ~/Henrietta/data
-
-# On a different host where it's mounted elsewhere:
-ln -s /mnt/whatever/Commissioning ~/Henrietta/data
-
-# Or skip the symlink and use the env var (e.g. in ~/.bashrc):
-export HENRIETTA_DATA_DIR=/mnt/whatever/Commissioning
+# or: export HENRIETTA_DATA_DIR=/mnt/.../Commissioning
 ```
 
-If none of those resolve, `load_frames` raises with a message telling you the
-three options. The skill never writes into the resolved directory — it only
-reads (see project-wide `/scidata` read-only convention).
+### Observing log CSV
+
+1. `log_csv=Path(...)` argument to `find_frames_for(...)`.
+2. `$HENRIETTA_LOG_CSV` environment variable.
+3. The symlink `~/Henrietta/observing-log.csv`.
+
+```bash
+ln -s "/path/to/Commissioning Run (2026-04-14 to 2026-05-04) Observing Log - Sheet1.csv" \
+      ~/Henrietta/observing-log.csv
+# or: export HENRIETTA_LOG_CSV=/path/to/that.csv
+```
+
+If a resolver finds nothing, the call raises with a message listing the three
+options. The skill never writes into either resolved location — read-only,
+per the project-wide `/scidata` rule.
 
 ## Reference implementation
 
@@ -63,8 +81,9 @@ Drop this into the experiment's helper module, or run it ad-hoc. It is small
 on purpose; don't extend it without a reason.
 
 ```python
-"""load_frames — identify, confirm, read."""
+"""load_frames — find_frames_for + load_frames."""
 import os
+import re
 from pathlib import Path
 from collections.abc import Iterable
 import numpy as np
@@ -74,31 +93,35 @@ from astropy.io import fits
 # headers are tolerated; conflicting values are not.
 HOMOGENEITY_KEYS = ("FILTER", "GRISM", "SLIT", "EXPTIME", "OBSTYPE", "MODE")
 
-# Where to find the raw Commissioning frames. Resolution order:
-#   1. data_dir= argument to load_frames()
-#   2. $HENRIETTA_DATA_DIR environment variable
-#   3. ~/Henrietta/data  (team convention: symlink to wherever scidata is
-#      mounted on this machine)
+# Resolution order for both paths: explicit arg → env var → team symlink.
 # Mount points vary by machine — never hardcode /carnegie/scidata/... in
-# analysis scripts; rely on this resolver instead.
-DEFAULT_SYMLINK = Path.home() / "Henrietta" / "data"
+# analysis scripts; rely on these resolvers instead.
+DATA_SYMLINK = Path.home() / "Henrietta" / "data"
+LOG_SYMLINK  = Path.home() / "Henrietta" / "observing-log.csv"
+
+
+def _resolve_path(explicit, env_var, default_symlink, kind_label):
+    if explicit is not None:
+        return Path(explicit)
+    env = os.environ.get(env_var)
+    if env:
+        return Path(env)
+    if default_symlink.exists():
+        return default_symlink
+    raise FileNotFoundError(
+        f"Cannot locate Henrietta {kind_label}. Do one of:\n"
+        f"  - symlink {default_symlink} -> wherever it lives on this host\n"
+        f"  - export {env_var}=/path/to/{default_symlink.name}\n"
+        f"  - pass the path explicitly as an argument"
+    )
 
 
 def _resolve_data_dir(data_dir=None):
-    if data_dir is not None:
-        return Path(data_dir)
-    env = os.environ.get("HENRIETTA_DATA_DIR")
-    if env:
-        return Path(env)
-    if DEFAULT_SYMLINK.exists():
-        return DEFAULT_SYMLINK
-    raise FileNotFoundError(
-        "Cannot locate Henrietta data. Do one of:\n"
-        f"  - symlink {DEFAULT_SYMLINK} -> wherever scidata is mounted (e.g. "
-        "/carnegie/scidata/groups/kallisto/Henrietta/data/images/raw/Commissioning)\n"
-        "  - export HENRIETTA_DATA_DIR=/path/to/Commissioning\n"
-        "  - pass data_dir=Path(...) explicitly to load_frames()"
-    )
+    return _resolve_path(data_dir, "HENRIETTA_DATA_DIR", DATA_SYMLINK, "data directory")
+
+
+def _resolve_log_csv(log_csv=None):
+    return _resolve_path(log_csv, "HENRIETTA_LOG_CSV", LOG_SYMLINK, "observing-log CSV")
 
 
 def _expand_ids(ids):
@@ -110,6 +133,83 @@ def _expand_ids(ids):
     if isinstance(ids, Iterable):
         return sorted(int(i) for i in ids)
     raise TypeError(f"frame_ids must be int, range, or iterable of ints; got {type(ids).__name__}")
+
+
+# Pattern for a "File #" cell in the observing log. Each cell is either a
+# single int ("123") or an inclusive range separated by one of: `-`, `..`,
+# `...` (operators have used all three over the run). Whitespace tolerated.
+_RANGE_RE = re.compile(r"^\s*(\d+)\s*(?:-|\.{2,3})\s*(\d+)\s*$")
+_INT_RE   = re.compile(r"^\s*(\d+)\s*$")
+
+
+def _expand_csv_cell(cell):
+    """Return the list of frame IDs encoded in one File # cell, or []."""
+    if cell is None:
+        return []
+    s = str(cell)
+    m = _RANGE_RE.match(s)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        lo, hi = (a, b) if a <= b else (b, a)
+        return list(range(lo, hi + 1))
+    m = _INT_RE.match(s)
+    if m:
+        return [int(m.group(1))]
+    return []
+
+
+def find_frames_for(target=None, purpose=None, log_csv=None):
+    """Look up frame IDs in the commissioning observing-log CSV.
+
+    Pure metadata lookup — does not open any FITS files. Matching is
+    case-insensitive substring against the named columns; pass both
+    arguments to require both to match (AND, not OR).
+
+    Parameters
+    ----------
+    target : str, optional
+        Substring to match against the ``Target (RA/Dec)`` column.
+    purpose : str, optional
+        Substring to match against the ``Purpose`` column.
+    log_csv : Path, optional
+        Path to the observing-log CSV. If omitted, resolves via
+        ``$HENRIETTA_LOG_CSV`` or the ``~/Henrietta/observing-log.csv``
+        symlink.
+
+    Returns
+    -------
+    list[int]
+        Sorted unique frame IDs from the matching rows' ``File #`` cells.
+
+    Notes
+    -----
+    The CSV log captures *intent* (what the operator typed). Headers are
+    authoritative for what was *actually* recorded. After loading the
+    matching frames you may want to cross-check ``hdr['OBJECT']`` (or the
+    equivalent) against ``target`` and surface disagreements to the user.
+    """
+    if target is None and purpose is None:
+        raise ValueError("provide target=, purpose=, or both")
+
+    # Lazy import — pandas isn't needed unless you actually call this.
+    import pandas as pd
+
+    path = _resolve_log_csv(log_csv)
+    df = pd.read_csv(path)
+    df.columns = [c.strip() for c in df.columns]
+    df["Target (RA/Dec)"] = df["Target (RA/Dec)"].astype(str)
+    df["Purpose"] = df["Purpose"].astype(str)
+
+    mask = np.ones(len(df), dtype=bool)
+    if target is not None:
+        mask &= df["Target (RA/Dec)"].str.contains(target, case=False, na=False, regex=False)
+    if purpose is not None:
+        mask &= df["Purpose"].str.contains(purpose, case=False, na=False, regex=False)
+
+    ids = set()
+    for cell in df.loc[mask, "File #"]:
+        ids.update(_expand_csv_cell(cell))
+    return sorted(ids)
 
 
 def _paths_for(frame_id, kind, data_dir):
@@ -207,12 +307,18 @@ def load_frames(frame_ids, kind="fitted", data_dir=None):
     arrays = [fits.getdata(p).astype(np.float32) for p in flat_paths]
     if kind == "fitted":
         data = np.stack(arrays, axis=0)                  # (N, H, W)
-        headers = np.array(headers_flat, dtype=object)   # (N,)
+        # NB: np.array(list_of_Header, dtype=object) would descend into each
+        # Header (it's iterable) and produce a 2-D array. Allocate-then-assign
+        # keeps the Header objects atomic.
+        headers = np.empty(len(headers_flat), dtype=object)
+        headers[:] = headers_flat                        # (N,)
     else:
         n = len(ids)
         h, w = arrays[0].shape
         data = np.stack(arrays, axis=0).reshape(n, n_samples, h, w)
-        headers = np.array(headers_flat, dtype=object).reshape(n, n_samples)
+        headers = np.empty(n * n_samples, dtype=object)
+        headers[:] = headers_flat
+        headers = headers.reshape(n, n_samples)
 
     return data, headers
 ```
@@ -220,18 +326,33 @@ def load_frames(frame_ids, kind="fitted", data_dir=None):
 ## Usage
 
 ```python
-# Six fitted slope frames, returns (6, 2048, 2048) + (6,) header array
-data, hdr = load_frames(range(1755, 1761))
+# Explicit frame range
+data, hdr = load_frames(range(1755, 1759))           # (4, 2048, 2048) + (4,)
 
-# Same six ramps as SUTR, returns (6, 23, 2048, 2048) + (6, 23) header array
-data, hdr = load_frames(range(1755, 1761), kind="ramp", n_samples=23)
+# Same range as SUTR samples — n_samples is discovered from disk
+data, hdr = load_frames(range(1755, 1759), kind="ramp")
+# data.shape -> (4, 23, 2048, 2048); hdr.shape -> (4, 23)
 
-# A non-contiguous list works too
-data, hdr = load_frames([1755, 1757, 1759])
+# Look up by target via the CSV log
+ids = find_frames_for(target="HD120270")
+print(f"{len(ids)} frames in log for HD120270")
+data, hdr = load_frames(ids)                          # may raise on inhomogeneity
+
+# Narrow to just the science (Purpose contains 'spectrum' or 'science')
+ids = find_frames_for(target="HD120270", purpose="science")
+data, hdr = load_frames(ids)
 
 # Inspect headers like a numpy array
 print(hdr.shape, hdr[0]["FILTER"], hdr[0]["EXPTIME"])
 ```
+
+## When `find_frames_for` returns a long mixed list
+
+Operator entries are messy — a single target often spans acquisition images,
+spectra, multiple nights, nods, and "extra" steps. The matching list will
+almost always be inhomogeneous in some header, which is what you want: it
+forces you to narrow with `purpose=` (or post-filter the returned IDs) until
+the set is scientifically meaningful before passing it to `load_frames`.
 
 ## When the confirm step fails
 
