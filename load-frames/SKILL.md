@@ -351,6 +351,18 @@ def _value_counts(values, top=10):
     return items[:top], len(counts)
 
 
+def _safe_header_get(h, key, default=None):
+    """Some Henrietta FITS cards (notably OBJECT) are malformed and raise
+    VerifyError on access. Return ``default`` in that case so a bad card in
+    one frame doesn't poison the whole summary."""
+    if key not in h:
+        return default
+    try:
+        return h[key]
+    except Exception:
+        return default
+
+
 def summarize(frame_ids=None, kind="fitted", log_csv=None, data_dir=None, top=10, show=True):
     """Describe the observing log and (optionally) the FITS headers of a set.
 
@@ -419,10 +431,13 @@ def summarize(frame_ids=None, kind="fitted", log_csv=None, data_dir=None, top=10
             if p is None or not p.exists():
                 missing.append(fid)
                 continue
-            hdrs.append(fits.getheader(p))
+            try:
+                hdrs.append(fits.getheader(p, output_verify="silentfix+ignore"))
+            except Exception:
+                missing.append(fid)
         hdr_summary = {"frames_with_headers": len(hdrs), "frames_missing": missing, "by_key": {}}
         for k in _HDR_PROFILE_KEYS:
-            vals = [h[k] for h in hdrs if k in h]
+            vals = [v for v in (_safe_header_get(h, k) for h in hdrs) if v is not None]
             if vals:
                 items, ndistinct = _value_counts(vals, top=top)
                 hdr_summary["by_key"][k] = {"distinct": ndistinct, "top": items, "present_in": len(vals)}
