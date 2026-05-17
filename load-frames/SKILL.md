@@ -433,10 +433,38 @@ def summarize(frame_ids=None, kind="fitted", log_csv=None, data_dir=None, top=10
     return out
 
 
+# Keys/columns that define the operational configuration. Surfaced as a one-
+# line summary at the top of each section so "what filter and grism were
+# in?" is the first thing you see, before per-key value counts.
+_CONFIG_HDR_KEYS = ("FILTER", "GRISM", "SLIT", "MODE")
+_CONFIG_CSV_COLS = ("Filter", "Grism", "Slit", "mode")
+
+
+def _config_line(by_key_or_col, keys):
+    """Render the dominant value per key as 'KEY=value (pct%)' or 'KEY=mixed: ...'."""
+    parts = []
+    for k in keys:
+        info = by_key_or_col.get(k)
+        if not info or not info["top"]:
+            continue
+        top_val, top_n = info["top"][0]
+        total = sum(n for _, n in info["top"])  # may underrepresent if truncated
+        if info["distinct"] == 1:
+            parts.append(f"{k}={top_val}")
+        else:
+            pct = (100 * top_n / total) if total else 0
+            others = ", ".join(f"{v}×{n}" for v, n in info["top"][1:4])
+            parts.append(f"{k}={top_val} ({pct:.0f}%; also {others})")
+    return ", ".join(parts) if parts else None
+
+
 def _print_summary(s, indent=""):
     csv = s["csv"]
     print(f"{indent}=== Observing log: {csv['path']} ===")
     print(f"{indent}{csv['rows']} rows, {len(csv['columns'])} columns")
+    cfg = _config_line(csv["by_column"], _CONFIG_CSV_COLS)
+    if cfg:
+        print(f"{indent}Configuration (from CSV): {cfg}")
     print(f"{indent}Columns: {', '.join(csv['columns'])}")
     print()
     print(f"{indent}--- value counts (per column, top of each) ---")
@@ -451,6 +479,10 @@ def _print_summary(s, indent=""):
         print(f"{indent}=== FITS headers: {h['frames_with_headers']} frames profiled"
               + (f", {len(h['frames_missing'])} missing on disk" if h["frames_missing"] else "")
               + " ===")
+        cfg = _config_line(h["by_key"], _CONFIG_HDR_KEYS)
+        if cfg:
+            print(f"{indent}Configuration (from FITS): {cfg}")
+        print()
         for key, info in h["by_key"].items():
             head = f"{key} ({info['distinct']} distinct, present in {info['present_in']})"
             print(f"{indent}  {head}")
