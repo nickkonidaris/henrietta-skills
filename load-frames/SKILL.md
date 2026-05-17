@@ -251,7 +251,72 @@ def _check_homogeneous(headers_flat, frame_ids_flat):
             raise ValueError(f"frame set is inhomogeneous in {k}: {summary}")
 
 
-def load_frames(frame_ids, kind="fitted", data_dir=None):
+# Reference-pixel border: 4 pixels on each edge of the 2048x2048 H2RG. These
+# are not photosensitive — they only carry electronics noise. A healthy
+# detector + readout should give refpix std of a few DN (σ_R ≈ 17.5 e⁻ ≈
+# 4.4 DN per single sample, ~6 DN for a CDS or slope frame). Anything above
+# ~20 DN signals a problem: bias instability, pickup, a stale frame from a
+# different mode, or an analysis bug treating the wrong region as refpix.
+H2RG_REFPIX_WIDTH = 4
+
+
+def _refpix_std(image):
+    """Std-dev (DN) of the 4-pixel reference border of a 2-D H2RG frame.
+
+    Concatenates top, bottom, left, right strips with corners excluded from
+    the side strips so each refpix contributes once.
+    """
+    w = H2RG_REFPIX_WIDTH
+    top    = image[:w, :].ravel()
+    bottom = image[-w:, :].ravel()
+    left   = image[w:-w, :w].ravel()
+    right  = image[w:-w, -w:].ravel()
+    return float(np.concatenate([top, bottom, left, right]).std())
+
+
+def _check_refpix_std(data, ids, kind, threshold):
+    """Refpix-σ sanity check.
+
+    For ``kind="fitted"`` the data is differenced already, so check σ directly
+    on each frame. For ``kind="ramp"`` the raw samples carry a ~10⁴ DN bias
+    pedestal whose spatial pattern dominates spatial std (~100+ DN of
+    structure, not noise), so first form a CDS image per ramp (last sample
+    minus first) and check that. One std per *ramp ID* in both cases.
+
+    Pass ``threshold=None`` to skip the check.
+    """
+    if threshold is None:
+        return
+    if kind == "fitted":
+        per_ramp_image = data                                # (N, H, W)
+    else:
+        per_ramp_image = data[:, -1] - data[:, 0]            # (N, H, W) CDS
+    bad = []
+    for i, img in enumerate(per_ramp_image):
+        s = _refpix_std(img)
+        if s > threshold:
+            bad.append((ids[i], s))
+    if bad:
+        sample = "; ".join(f"hen{fid}: refpix σ={s:.1f} DN" for fid, s in bad[:5])
+        more = f" (+{len(bad)-5} more)" if len(bad) > 5 else ""
+        what = "frame" if kind == "fitted" else "ramp (CDS)"
+        raise RefpixError(
+            f"{len(bad)} {what}(s) exceed refpix σ threshold of {threshold} DN: "
+            f"{sample}{more}. Pass refpix_max_std=None to skip the check, "
+            f"or a larger float to raise the bar."
+        )
+
+
+class RefpixError(ValueError):
+    """Raised by load_frames when reference-pixel std exceeds the threshold.
+
+    Subclass of ValueError so existing ``except ValueError`` handlers still
+    catch it, but callers that want to suppress just this check can ``except
+    RefpixError``.
+    """
+
+
+def load_frames(frame_ids, kind="fitted", data_dir=None, refpix_max_std=20.0):
     """Identify, confirm, and read a set of Henrietta frames.
 
     Parameters
@@ -267,6 +332,13 @@ def load_frames(frame_ids, kind="fitted", data_dir=None):
         Where the raw frames live. If omitted, resolves from
         ``$HENRIETTA_DATA_DIR`` or the ``~/Henrietta/data`` symlink. See
         ``_resolve_data_dir`` and the README for setup.
+    refpix_max_std : float or None, default 20.0
+        Sanity threshold on the std-dev of the 4-pixel reference-pixel border,
+        in DN, evaluated independently for every 2-D plane that gets read.
+        Raises ``RefpixError`` if any frame exceeds it. A healthy frame is
+        typically σ ≈ 4–6 DN (single sample → CDS/slope), so 20 DN is loose;
+        bias instability or pickup will trip it. Pass ``None`` to disable;
+        pass a larger float to override for known-noisy data.
 
     Returns
     -------
@@ -282,6 +354,9 @@ def load_frames(frame_ids, kind="fitted", data_dir=None):
     FileNotFoundError : any expected path is missing.
     ValueError       : the set is inhomogeneous in any HOMOGENEITY_KEYS field,
                        or for ramps the on-disk sample count disagrees across IDs.
+    RefpixError      : at least one frame has refpix σ > ``refpix_max_std``.
+                       Subclass of ``ValueError``; catch separately to suppress
+                       just this check.
     """
     ids = _expand_ids(frame_ids)
     data_dir = _resolve_data_dir(data_dir)
@@ -326,6 +401,12 @@ def load_frames(frame_ids, kind="fitted", data_dir=None):
         headers = np.empty(n * n_samples, dtype=object)
         headers[:] = headers_flat
         headers = headers.reshape(n, n_samples)
+
+    # 4. confirm — reference-pixel std is sane. Runs after the read because we
+    # need the actual pixel data; structured this way so callers can suppress
+    # just this check (except RefpixError) without disabling the upstream
+    # confirms.
+    _check_refpix_std(data, ids, kind, refpix_max_std)
 
     return data, headers
 
